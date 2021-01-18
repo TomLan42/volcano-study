@@ -12,6 +12,39 @@ Kube-Batch:
 Allocate -> Backfill -> Preempt -> Reclaim
 
 
+## Scheduler 入口
+[scheduler.go](https://github.com/volcano-sh/volcano/blob/c688677d9e8525ebc242a0527927bfb954d1a414/pkg/scheduler/scheduler.go#L39)
+
+Q: What does it take to assemble a volcano scheduler?
+A: Basically: a cache, a set of actions, a set of plugins to carry out those actions.
+
+1. Run   
+load configuration -> run cache ->  for {runOnce/1秒}。
+
+2. RunOnce   
+每一次runOnce会开一个session。session里面有plugin的信息。每个[]action依次execute，需要依赖session的信息。
+
+``` go
+	actions := pc.actions
+	plugins := pc.plugins
+	configurations := pc.configurations
+	pc.mutex.Unlock()
+
+	ssn := framework.OpenSession(pc.cache, plugins, configurations)
+	defer framework.CloseSession(ssn)
+
+	for _, action := range actions {
+		actionStartTime := time.Now()
+		action.Execute(ssn)
+		metrics.UpdateActionDuration(action.Name(), metrics.Duration(actionStartTime))
+	}
+	metrics.UpdateE2eDuration(metrics.Duration(scheduleStartTime))
+
+```
+
+
+3. watchSchedulerConf   
+还可以热修改scheduler的配置文件。所以```loadSchedulerConf```要加锁。
 
 
 ## Cache
@@ -87,10 +120,67 @@ snapshot := &schedulingapi.ClusterInfo{
 9. RecordJobStatusEvent  
 基本上是调用```recordPodGroupEvent```。貌似是eventchan的生产者？
 
+## Framework
+
+Framework不出意外规定了一个调度周期的流程。看一个package先看看interface。
+
+1. interface.go
+定义了Action和Plugin两个interface(抽象类)。其中Action有三个动作：initilize, execute, uninitilize. 一个plugin需要具有两个动作OnSessionOpen和OnSessionClose.
+
+2. framework.go   
+framework.go以及framework包中都咩有framework结构体～ 但是是session的入口。  
+    - framework.OpenSession(...) -> openSession(cache)
+    - 先一个tier一个tier地把plugins build出来，存到session的一个map里面。然后每个plugins做OnSessionOpen的操作。
+    - framework.CloseSession(...) -> closeSession(ssn)
+    - 每个plugin执行OnSessionClose的操作。
+
+疑问： 
+- tier到底是啥？
+实际上scheduler结构体中的plugins就是conf.Tier类型。一个tier包含一串plugins：
+``` go
+// Tier defines plugin tier
+type Tier struct {
+	Plugins []PluginOption `yaml:"plugins"`
+}
+```
+配置文件长这样：
+``` yaml
+actions: "reclaim, allocate, backfill, preempt"
+tiers:
+- plugins:
+  - name: priority
+  - name: gang
+  - name: conformance
+- plugins:
+  - name: drf
+  - name: predicates
+  - name: proportion
+  - name: nodeorder
+```
+那是怎样确定执行哪个tier的plugin呢？这个应该是在action里面的逻辑。因为此处framework只是在初始化每个plugin。具体的执行是由action完成。之后再看。
+
+3. plugins.go   
+    - framework包中的package文件主要是用于plugin，action的注册及建造。GetPluginBuilder是要根据plugin的name从pluginBuilders这个map中取出一个能用的pluginBuilder函数。那肯定就有将这些函数注册到这个map的一个步骤，也就是 RegisterPluginBuilder。这个register的步骤在plugins包中有体现。https://github.com/volcano-sh/volcano/blob/e4777f1751a15f07df7a3754b83a6e29e79880ef/pkg/scheduler/plugins/factory.go  
+    - action的注册类似。
+4. plugins.go 自定义的plugin较为特殊。   
+这个要重点看一下，应为关系到实现lease term和多租户的自定义插件实现。  
+插件应该是可以单独编译的。 LoadCustomPlugins会加载```*.so```文件，解析出一个pluginBuilder, 在将这个pluginBuilder注册到pluginBuildersz这个map里去。https://github.com/volcano-sh/volcano/blob/c688677d9e8525ebc242a0527927bfb954d1a414/pkg/scheduler/framework/plugins.go#L63 。loadPluginBuilder使用了go原生的plugin的包来```plug.Lookup("New")```找到New函数的symbol，再将这个symbol type-assertion一下```symBuilder.(PluginBuilder)```. 学到了。
+
+plugins.go这个文件主要就是两个单例：
+``` go 
+// Plugin management
+var pluginBuilders = map[string]PluginBuilder{}
+// Action management
+var actionMap = map[string]Action{}
+```
+来管理和实现plugin和action的拓展性。
 
 
 
 
 
-
-
+参考资料
+1. https://zoux86.github.io/post/2019-12-02-volcano%E7%AE%80%E4%BB%8B/
+2. https://zoux86.github.io/post/2019-11-24-kube-batch-%E5%A6%82%E4%BD%95%E5%AE%9E%E7%8E%B0gang-scheduler/
+3. https://zoux86.github.io/post/2019-12-02-volcano-scheduler%E4%BB%A3%E7%A0%81%E6%B5%81%E7%A8%8B%E5%9B%BE/
+4. https://zoux86.github.io/post/2019-11-24-kube-batch-%E7%AE%80%E4%BB%8B/
