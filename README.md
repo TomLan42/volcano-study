@@ -176,6 +176,161 @@ var actionMap = map[string]Action{}
 来管理和实现plugin和action的拓展性。
 
 
+5. session.go   
+session是volcano重要的一个模块。一个session包含了一次调度所需要的所有信息。  
+session记录的状态有：
+``` go
+	podGroupStatus map[api.JobID]scheduling.PodGroupStatus
+	Jobs          map[api.JobID]*api.JobInfo
+	Nodes         map[string]*api.NodeInfo
+	Queues        map[api.QueueID]*api.QueueInfo
+	NamespaceInfo map[api.NamespaceName]*api.
+```
+从cache.snapshot中来。每个job还要jobValid一下，目前不知道啥意思。
+另外有一堆functions，看起来分为这几大类:
+- api.CompareFn{} 
+- api.PredicateFn{} 
+- api.BestNodeFn{}
+- api.BatchNodeOrderFn{}
+- api.NodeMapFn{}
+- api.NodeReduceFn{}
+- api.EvictableFn{}
+- api.ValidateFn{}
+- api.ValidateExFn{}
+- api.TargetJobFn{}
+- api.ReservedNodesFn{}
+
+
+每个plugins会在onSessionOpen时将填写session的这一堆fns。那么问题是这些plugins的onSessionOpen方法是什么时候被调用的呢？-> framework.OpenSession时每个plugin会调用各自的这个方法。
+https://github.com/volcano-sh/volcano/blob/9f260d1bf455bb5caebc3eb3fb7a1e50c5aeb7c2/pkg/scheduler/framework/framework.go#L46
+
+ssn中有一些方法，例如Pipeline, Allocate, Evict, UpdatePodGroupCondition. 做的事情都是在session里面改变api结构体的状态。在各个action中应该都会有调用。
+dispatch负责与cache动作对接。  
+这些方法涉及到三个地方状态的变化。1.首先ssn会改变自己的状态，2.调用cache.Bind时，cache会改变自己的状态。3.cahce.Bind时会调用client-go让api-server改变状态。
+
+
+
+## Action
+
+action包，即动作引擎，是volcano scheduler中最为重要的一个包。它直接决定了ssn中的状态该如何改变。  
+
+volcano的action比kube-batch多了三个：
+|volcano|kube-batch|
+|-|-|
+|allocate|allocate|
+|backfill|backfill|
+|preempt|preempt|
+|reclaim|reclaim|
+|enqueue||
+|reserve||
+|elect||
+
+kube-batch scheduler默认的action为:
+``` yaml
+actions: "reclaim, allocate, backfill, preempt"
+```
+volcano scheduler默认的action为：
+``` yaml
+actions: "enqueue, allocate, backfill"
+```
+那么就先从这三个action开始看。
+
+1. Enqueue
+
+用的Fn有```ssn.QueueOrderFn```，```ssn.JobOrderFn```
+
+Execute里有一个jobsMap:
+``` go
+jobsMap := map[api.QueueID]*util.PriorityQueue{}
+```
+以一个个priorityqueue的形式存每个job。每一个priorityqueue(即我们yaml中给一个job指定的queue)又以priorityqueue的方式排列（Q中Q).
+
+Execute的第一段逻辑就是将ssn的所有状态为PodGroupPending的jobs以这种方式入队排列好。
+
+Execute的第二段逻辑是将先计算出一个idle的资源量（api里的resource_info类型). 根据queue的次序和queue内job的次序遍历，如果idle资源能满足，将这个job的podgroup状态设置为PodGroupInqueue并在ssn中更新。（每次inqueue一个，idle资源要扣除一个）。注意在此处没有对任何全局的队列产生影响，只是将ssn中的jobs的podgroup状态改变为了PodGroupInqueue。所谓的priorityqueue只对遍历的顺序产生了影响。
+
+2. Allocate
+Allocate是调度的核心动作。代码注释中给出的调度逻辑为：
+```
+	// the allocation for pod may have many stages
+	// 1. pick a namespace named N (using ssn.NamespaceOrderFn)
+	// 2. pick a queue named Q from N (using ssn.QueueOrderFn)
+	// 3. pick a job named J from Q (using ssn.JobOrderFn)
+	// 4. pick a task T from J (using ssn.TaskOrderFn)
+	// 5. use predicateFn to filter out node that T can not be allocated on.
+	// 6. use ssn.NodeOrderFn to judge the best node and assign it to T
+
+```
+一共四个priorityqueue，namespace之间一个，queue之间一个，job之间一个，job里的task之间一个。每个都用一个fn来排序。
+
+PodGroupPending的podgroup不会被考虑。对了，podgroup到底有几个状态？(A: ```PodGroupPending```,```PodGroupRunning```,```PodGroupUnknown```,```PodGroupInqueue```) plugin的JobValid没通过的也不行。
+
+嵌套的map。表示一个job有两种multi-tenet属性，即namesapce和queue：
+``` go
+jobsMap := map[api.NamespaceName]map[api.QueueID]*util.PriorityQueue{}
+```
+但每个ns的queue会有重复（因为有job来自不同的ns，但是相同的queue名）。所以单个map[api.NamespaceName][QueueID]中的queue们的排序没有用pq来实现。因为此处希望各个ns中的queue的排序是独立的，不要互相干扰。
+
+``` go
+for queueID := range queueInNamespace {
+    ....
+    if queue == nil || ssn.QueueOrderFn(currentQueue, queue) {
+        queue = currentQueue
+    }
+}
+```
+
+首先遍历每个queueInNamespace里的每个job。对于每个job，会新建一个task的pq。一个task一个task的遍历。
+
+会调用redicateFn来predicate node
+
+``` go
+predicateNodes, fitErrors := util.PredicateNodes(task, nodes, predicateFn)
+```
+以此产生的candidate node又会被各种function排序
+``` go
+    nodeScores := util.PrioritizeNodes(task, candidateNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
+
+    node := ssn.BestNodeFn(task, nodeScores)
+    if node == nil {
+        node = util.SelectBestNode(nodeScores)
+    }
+```
+
+最终的绑定由statment来实现。statement将所有需要allocate的task收集好，最后统一commit。
+
+
+
+一个疑问：每一个task在predicat的时候都遍历的全部的node，queue的资源分区是如何实现的？如何限制了每个task可见的node范围？是overusedFn吗?
+
+3. Backfill
+Backfill中目前只支持对没有指定资源数的opportunistic task进行的node绑定。其他case还在开发之中。
+``` go 
+
+if task.InitResreq.IsEmpty() {
+ ....
+ 	for _, node := range ssn.Nodes {
+		 ...
+
+	 }
+} else {
+	// TODO (k82cn): backfill for other case.
+}
+
+```
+
+
+
+## Plugins
+
+重点关注多租户的plugin实现。
+
+design doc中提到的关于多租户的：[queue.md](https://github.com/volcano-sh/volcano/blob/d791592e0051c76e39a259f23532bc35889d01d0/docs/design/queue/queue.md), [fairshare.md](https://github.com/volcano-sh/volcano/blob/d791592e0051c76e39a259f23532bc35889d01d0/docs/design/fairshare.md).
+
+queue.md中提到了queue的share by weight功能是在propotion plugin中实现的。Propotion这个plugin在reclaim action中也有用到。文档中提到的Backfill中的```ignore deserved guarantee of queue to fill idle resources as much as possible.```并没有实现。
+
+
+fairshare.md介绍的是同一个queue中不同user间的fair share问题。在valcano中，除了每个queue有一个weight，每一个ns的ResourceQuota中可以附加一个```volcano.sh/namespace.weight```的field。
 
 
 
