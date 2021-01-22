@@ -339,3 +339,21 @@ fairshare.md介绍的是同一个queue中不同user间的fair share问题。在v
 2. https://zoux86.github.io/post/2019-11-24-kube-batch-%E5%A6%82%E4%BD%95%E5%AE%9E%E7%8E%B0gang-scheduler/
 3. https://zoux86.github.io/post/2019-12-02-volcano-scheduler%E4%BB%A3%E7%A0%81%E6%B5%81%E7%A8%8B%E5%9B%BE/
 4. https://zoux86.github.io/post/2019-11-24-kube-batch-%E7%AE%80%E4%BB%8B/
+
+
+
+var queue *api.QueueInfo
+for queueID := range queueInNamespace {
+	currentQueue := ssn.Queues[queueID]
+	if ssn.Overused(currentQueue) {
+		klog.V(3).Infof("Namespace <%s> Queue <%s> is overused, ignore it.", namespace, currentQueue.Name)
+		delete(queueInNamespace, queueID)
+		continue
+	}
+
+	if queue == nil || ssn.QueueOrderFn(currentQueue, queue) {
+		queue = currentQueue
+	}
+}
+
+
